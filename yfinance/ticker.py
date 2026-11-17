@@ -61,11 +61,40 @@ class Ticker(TickerBase):
             return dict(**opt[0],underlying=self._underlying) if len(opt) > 0 else {}
         return {}
 
+    def _download_option_chain_for_strike(self, strike: str) -> Dict[str, Any]:
+        if strike is None:
+            raise ValueError(f"Strike price must be supplied for option_chains")
+
+        ret = {}
+        url = f"{_BASE_URL_}/v7/finance/options/{self.ticker}?straddle=false&strikeMin={strike}&strikeMax={strike}&getAllData=true"
+
+        r = self._data.get(url=url).json()
+        # print(r)
+        if len(r.get('optionChain', {}).get('result', [])) > 0:
+            for exp in r['optionChain']['result'][0]['expirationDates']:
+                self._expirations[_pd.Timestamp(exp, unit='s').strftime('%Y-%m-%d')] = exp
+
+            self._underlying = r['optionChain']['result'][0].get('quote', {})
+
+            # by specifying a strike price, the resulting json structure is different than for specifying a date.
+            # instead of returning
+
+            chains = r['optionChain']['result'][0].get('options', [])
+
+            print('chains')
+            print(type(chains))
+
+            # return dict(chains=chains,underlying=self._underlying) if len(chains) > 0 else {}
+            ret = dict(chains=chains, underlying=self._underlying) if len(chains) > 0 else {}
+
+        return ret
+
     def _options2df(self, opt: List[Dict[str, Any]], tz: Union[str, Any, None] = None) -> _pd.DataFrame:
         data = _pd.DataFrame(opt).reindex(columns=[
             'contractSymbol',
             'lastTradeDate',
             'strike',
+            'expiration',
             'lastPrice',
             'bid',
             'ask',
@@ -78,13 +107,26 @@ class Ticker(TickerBase):
             'contractSize',
             'currency'])
 
+        data['expiration'] = _pd.to_datetime(
+            data['expiration'], unit = 's', utc = True)
+
         data['lastTradeDate'] = _pd.to_datetime(
             data['lastTradeDate'], unit='s', utc=True)
         if tz is not None:
             data['lastTradeDate'] = data['lastTradeDate'].dt.tz_convert(tz)
+            data['expiration'] = data['expiration'].dt.tz_convert(tz)
         return data
 
-    def option_chain(self, date: Optional[str] = None, tz: Union[str, Any, None] = None) -> OptionsTuple:
+    def option_chain(self, date: Optional[str] = None, strike: Optional[str] = None, tz: Union[str, Any, None] = None) -> OptionsTuple:
+
+        if date and strike:
+            raise ValueError(f"Both strike price and date cannot cannot be supplied for option_chains")
+
+        if strike:
+            # JSON returned for this call is different than for date calls so logic is
+            # handled in own path
+            return self._option_chain_by_strike(strike)
+
         if date is None:
             options = self._download_options()
         else:
@@ -108,7 +150,29 @@ class Ticker(TickerBase):
             "underlying": options['underlying']
         })
 
-    # ------------------------
+
+    def _option_chain_by_strike(self, strike: str, tz: Union[str,Any,None]=None) -> OptionsTuple:
+        if strike is None:
+            raise ValueError(f"Strike price must be supplied for option_chains")
+
+        else:
+            options = self._download_option_chain_for_strike(strike)
+
+        if not options:
+            return _namedtuple('Options',
+                               ['calls', 'puts', 'underlying'])(**{ "calls": None,
+                                                                    "puts": None,
+                                                                    "underlying": None })
+
+        calls = [option['calls'][0] for option in options['chains'] if len(option['calls']) > 0]
+        puts = [option['puts'][0] for option in options['chains'] if len(option['puts']) > 0]
+
+        return _namedtuple('Options', ['calls', 'puts', 'underlying'])(**{
+                                                                             "calls": self._options2df(calls, tz=tz),
+                                                                             "puts": self._options2df(puts, tz=tz),
+                                                                          "underlying": options['underlying']
+                                                                                         })
+        # ------------------------
 
     @property
     def isin(self):
